@@ -15,6 +15,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers import entity_registry as er
 
 try:
@@ -64,6 +65,29 @@ _STATE_CLASS_MAP = {
     "step3_gas_used": _SSC.TOTAL_INCREASING,
     "annual_pay_count": _SSC.TOTAL_INCREASING,
     "gas_energy_dashboard": _SSC.TOTAL_INCREASING,
+    "account_balance": _SSC.MEASUREMENT,
+    "arrears": _SSC.MEASUREMENT,
+    "bill_amount": _SSC.MEASUREMENT,
+    "estimated_gas_bill_amount": _SSC.MEASUREMENT,
+    "gas_price_step1": _SSC.MEASUREMENT,
+    "gas_price_step2": _SSC.MEASUREMENT,
+    "gas_price_step3": _SSC.MEASUREMENT,
+    "last_month_gas": _SSC.TOTAL,
+    "last_pay_amount": _SSC.MEASUREMENT,
+    "penalties": _SSC.MEASUREMENT,
+    "penalty_amount": _SSC.MEASUREMENT,
+    "revbl_amount": _SSC.MEASUREMENT,
+    "step1_gas_limit": _SSC.MEASUREMENT,
+    "step1_gas_sum": _SSC.TOTAL,
+    "step1_remain": _SSC.MEASUREMENT,
+    "step2_gas_limit": _SSC.MEASUREMENT,
+    "step2_gas_sum": _SSC.TOTAL,
+    "step2_remain": _SSC.MEASUREMENT,
+    "step3_gas_sum": _SSC.TOTAL,
+    "step3_remain": _SSC.MEASUREMENT,
+    "this_gas_used": _SSC.TOTAL,
+    "year_avg_gas": _SSC.TOTAL,
+
 }
 
 _DEVICE_CLASS_MAP = {
@@ -455,6 +479,7 @@ def _import_history_statistics(hass, entry, bill_history, current_reading=None):
     last_gas_sum = 0.0
     last_bill_sum = 0.0
     existing_months = set()
+    last_ts = 0
 
     try:
         db_conn = sqlite3.connect(db_path)
@@ -468,6 +493,7 @@ def _import_history_statistics(hass, entry, bill_history, current_reading=None):
                 existing_months.add(datetime.fromtimestamp(ts).strftime("%Y-%m"))
                 if ts > last_ts:
                     last_gas_sum = s
+                    last_ts = ts
 
         meta_bill = c.execute("SELECT id FROM statistics_meta WHERE statistic_id='crcgas:monthly_bill_amount'").fetchone()
         if meta_bill:
@@ -494,8 +520,8 @@ def _import_history_statistics(hass, entry, bill_history, current_reading=None):
         if not ym or len(ym) < 7:
             continue
         if ym in existing_months:
-            # Skip existing months but keep updating cumulative
-            pass  # keep going
+            # Skip existing months (already in statistics)
+            continue
         year, month = int(ym[:4]), int(ym[5:7])
         gas_amt = float(bill.get("gasAmt", 0) or 0)
         bill_amt = float(bill.get("billAmt", 0) or 0)
@@ -800,9 +826,25 @@ async def async_setup_entry(
 
         scan_interval = timedelta(hours=scan_interval_val)
 
-    else:
+    elif scan_interval_unit == "day":
 
-        # 非小时模式：设为最小1小时，day/week/month 定时逻辑在刷新回调中处理
+        # 每天模式：每 N 天抓一次（按天级周期轮询，至少1天）
+
+        scan_interval = timedelta(days=max(1, int(scan_interval_val)))
+
+    elif scan_interval_unit == "week":
+
+        # 每周模式：每 N 周抓一次
+
+        scan_interval = timedelta(weeks=max(1, int(scan_interval_val)))
+
+    elif scan_interval_unit == "month":
+
+        # 每月模式：按 30 天近似为一个月周期
+
+        scan_interval = timedelta(days=30 * max(1, int(scan_interval_val)))
+
+    else:
 
         scan_interval = timedelta(hours=1)
 
@@ -1184,7 +1226,7 @@ async def async_setup_entry(
 
                         result["this_gas_used"] = detail.get("gasUsed", 0) or result.get("last_bill_gas_amt", 0)
 
-                        result["bill_amount"] = detail.get("totalAmount", 0) or detail.get("billAmount", 0)
+                        result["bill_amount"] = detail.get("totalAmount", 0) or detail.get("billAmount", 0) or result.get("revbl_amount", 0)
 
                         result["penalty_amount"] = detail.get("penaltyAmount", 0)
 
@@ -1387,6 +1429,12 @@ async def async_setup_entry(
         _LOGGER.info(f"数据更新完成: 欠费¥{result['arrears']}, 读数{result['this_read']}, 状态={result['integration_status']}")
 
         result["last_fetch_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # bill_amount fallback: 如果 detail API 返回 0，用 revbl_amount 兜底
+        if not result.get("bill_amount") and result.get("revbl_amount"):
+            result["bill_amount"] = result["revbl_amount"]
+            _LOGGER.info("bill_amount 使用 revbl_amount 兜底: %s", result["bill_amount"])
+
         return result
 
 
@@ -1445,17 +1493,36 @@ async def async_setup_entry(
         try:
             with sqlite3.connect(db_path) as conn:
                 c = conn.cursor()
-                updated = 0
+                meta_fixed = 0
+                sum_fixed = 0
                 for sid in sensor_ids:
                     meta = c.execute(
-                        "SELECT id FROM statistics_meta WHERE statistic_id = ?", (sid,)
+                        "SELECT id, has_mean, has_sum FROM statistics_meta WHERE statistic_id = ?",
+                        (sid,),
                     ).fetchone()
                     if not meta:
                         continue
+                    mid, hm, hs = meta[0], meta[1], meta[2]
+
+                    # ① 修复 statistics_meta 字段（has_mean/has_sum 不应为 null）
+                    if hm is None or hs is None:
+                        new_hm = 0 if hm is None else hm
+                        new_hs = 1 if hs is None else hs
+                        c.execute(
+                            "UPDATE statistics_meta SET has_mean=?, has_sum=? WHERE id=?",
+                            (new_hm, new_hs, mid),
+                        )
+                        meta_fixed += 1
+                        _LOGGER.info(
+                            "修正 statistics_meta: %s has_mean=%s→%s has_sum=%s→%s",
+                            sid, hm, new_hm, hs, new_hs,
+                        )
+
+                    # ② 修复 short_term sum
                     latest = c.execute(
                         "SELECT sum, state FROM statistics_short_term "
                         "WHERE metadata_id = ? ORDER BY start_ts DESC LIMIT 1",
-                        (meta[0],),
+                        (mid,),
                     ).fetchone()
                     if not latest:
                         continue
@@ -1463,19 +1530,23 @@ async def async_setup_entry(
                     if state_val > 0 and abs(short_sum - state_val) > 0.01:
                         c.execute(
                             "UPDATE statistics_short_term SET sum = state WHERE metadata_id = ?",
-                            (meta[0],),
+                            (mid,),
                         )
                         rows = c.rowcount
-                        updated += rows
+                        sum_fixed += rows
                         _LOGGER.info(
                             "修正短期统计 sum: %s %.1f→%.1f (%d条)",
                             sid, short_sum, state_val, rows,
                         )
-                if updated:
+
+                if meta_fixed or sum_fixed:
                     conn.commit()
-                    _LOGGER.info("短期统计 sum 修正完成: 共 %d 条", updated)
+                    if meta_fixed:
+                        _LOGGER.info("statistics_meta 修正完成: %d 条", meta_fixed)
+                    if sum_fixed:
+                        _LOGGER.info("短期统计 sum 修正完成: %d 条", sum_fixed)
         except Exception as e:
-            _LOGGER.warning("短期统计 sum 修正失败: %s", e)
+            _LOGGER.warning("统计修正异常: %s", e)
 
     async def async_initial_setup():
 
@@ -1493,11 +1564,18 @@ async def async_setup_entry(
 
             return
 
-        # 修正短期统计 sum 冷启动问题
+        # 修正短期统计 sum 冷启动问题（立即执行，可能无记录）
         try:
             await hass.async_add_executor_job(_fix_statis_sum)
         except Exception as e:
             _LOGGER.warning("短期统计 sum 修正异常: %s", e)
+
+        # 5分钟后延时修正（等 recorder 编译完成后再查一次）
+        async def _fix_statis_deferred(_now):
+            _LOGGER.info("延时修正短期统计 sum（recorder 编译后）...")
+            await hass.async_add_executor_job(_fix_statis_sum)
+
+        async_call_later(hass, timedelta(seconds=300), _fix_statis_deferred)
 
 
 
