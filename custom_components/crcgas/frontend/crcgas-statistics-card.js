@@ -35,8 +35,9 @@ function _makeTipSVG(month, d1, d2, y1, y2, price, PL, SX, H, W, pos) {
   if (!sd1 && !sd2) return '';
   const g1 = sd1 ? Math.max(0, sd1.change).toFixed(1) : '0.0';
   const g2 = sd2 ? Math.max(0, sd2.change).toFixed(1) : '0.0';
-  const c1 = sd1 ? '¥' + (Math.max(0, sd1.change) * price).toFixed(0) : '¥0';
-  const c2 = sd2 ? '¥' + (Math.max(0, sd2.change) * price).toFixed(0) : '¥0';
+  // 优先用实际账单金额，无则用单价推算
+  const c1 = sd1 ? '¥' + (sd1.cost ? Math.max(0, sd1.cost).toFixed(0) : (Math.max(0, sd1.change) * price).toFixed(0)) : '¥0';
+  const c2 = sd2 ? '¥' + (sd2.cost ? Math.max(0, sd2.cost).toFixed(0) : (Math.max(0, sd2.change) * price).toFixed(0)) : '¥0';
   const TW = 100, TH = 44;
   let tx = pos ? Math.max(2, Math.min(W - TW - 2, pos.x - TW / 2)) : 2;
   let ty = pos ? Math.max(2, Math.min(H - TH - 2, pos.y - TH - 8)) : 2;
@@ -55,7 +56,7 @@ function _buildEntityIds(prefix) {
   return {
     balance: `${p}_ran_qi_zhang_hu_yu_e`,
     monthlyUsage: `${p}_ben_yue_lei_ji_yong_qi_liang`,
-    monthlyCost: `${p}_yu_gu_ran_qi_zhang_dan`,
+    monthlyCost: `${p}_zhang_dan_jin_e`,
     step1Remain: `${p}_yi_dang_sheng_yu_qi_liang`,
     step2Remain: `${p}_er_dang_sheng_yu_qi_liang`,
     status: `${p}_ji_cheng_zhuang_tai`,
@@ -270,39 +271,35 @@ class CrcgasStatisticsCard extends HTMLElement {
     const start = new Date(year, 0, 1).toISOString();
     const end = new Date(year + 1, 0, 1).toISOString();
     try {
-      // 优先用用户配置的 historyEntity, 否则自动检测统计实体
-      let statisticId = this._config.historyEntity;
-      if (!statisticId && this._hass && this._hass.states) {
-        // 在 hass.states 中查找燃气表统计实体 (燃气表总读数)
-        const statsEntity = Object.keys(this._hass.states).find(
-          id => id.startsWith('sensor.') && id.endsWith('ran_qi_zong_xiao_hao_liang')
-        );
-        if (statsEntity) {
-          statisticId = statsEntity;
-        } else {
-          // 兜底：用旧方式拼接
-          if (this._entityPrefix) {
-            statisticId = `${this._entityPrefix}_ran_qi_biao_li_shi_lei_ji`;
-          }
-        }
-      }
-      if (!statisticId) {
-        this._yearData[year] = {};
-        return;
-      }
+      // 使用外部统计（完整历史数据）
+      const statIds = ['crcgas:monthly_gas_usage', 'crcgas:monthly_bill_amount'];
+      // 用户配置的 historyEntity 可覆盖用气统计
+      if (this._config.historyEntity) statIds[0] = this._config.historyEntity;
       const result = await this._hass.callWS({
         type: 'recorder/statistics_during_period',
         start_time: start,
         end_time: end,
-        statistic_ids: [statisticId],
+        statistic_ids: statIds,
         period: 'month',
       });
-      const stats = result?.[statisticId] || [];
+      const gasStats = result?.[statIds[0]] || [];
+      const costStats = result?.[statIds[1]] || [];
+      // 按月份索引费用数据
+      const costByMonth = {};
+      for (const s of costStats) {
+        const d = new Date(s.start);
+        costByMonth[d.getMonth()] = s.change || 0;
+      }
       const byMonth = {};
-      for (const s of stats) {
+      for (const s of gasStats) {
         const d = new Date(s.start);
         const m = d.getMonth();
-        byMonth[m] = { change: s.change || 0, sum: s.sum || s.state || 0, state: s.state || 0 };
+        byMonth[m] = {
+          change: s.change || 0,
+          sum: s.sum || s.state || 0,
+          state: s.state || 0,
+          cost: costByMonth[m] || 0,
+        };
       }
       this._yearData[year] = byMonth;
     } catch (e) {
@@ -348,7 +345,7 @@ class CrcgasStatisticsCard extends HTMLElement {
     const v1 = [], v2 = [];
     for (let m = 0; m < months; m++) {
       let a = d1[m] ? d1[m].change : 0, b = d2[m] ? d2[m].change : 0;
-      if (mode === 'cost') { a *= p; b *= p; }
+      if (mode === 'cost') { a = d1[m] ? (d1[m].cost || a * p) : 0; b = d2[m] ? (d2[m].cost || b * p) : 0; }
       v1.push(Math.max(0, a));
       v2.push(Math.max(0, b));
     }
@@ -432,7 +429,9 @@ ${dots}`;
     const maxMonth = new Date().getMonth();
     const y1Total = Object.entries(d1).filter(([m]) => Number(m) <= maxMonth).reduce((s, [,v]) => s + Math.max(0, v.change || 0), 0);
     const y2Total = Object.entries(d2).filter(([m]) => Number(m) <= maxMonth).reduce((s, [,v]) => s + Math.max(0, v.change || 0), 0);
-    const y1Cost = y1Total * p, y2Cost = y2Total * p;
+    // 年度费用：优先用实际账单数据，无则用单价推算
+    const y1Cost = Object.values(d1).reduce((s, v) => s + (v.cost || v.change * p || 0), 0);
+    const y2Cost = Object.values(d2).reduce((s, v) => s + (v.cost || v.change * p || 0), 0);
     const unit = mode === 'gas' ? 'm³' : '元';
     const unitLabel = mode === 'gas' ? '用气量' : '费用';
     const y1Val = mode === 'gas' ? y1Total.toFixed(1) : '¥' + y1Cost.toFixed(0);
