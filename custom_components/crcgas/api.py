@@ -64,7 +64,7 @@ class HuarunGasApi:
             decoded = base64.urlsafe_b64decode(payload)
             return json.loads(decoded)
         except Exception as e:
-            _LOGGER.warning(f"JWT解码失败: {e}")
+            _LOGGER.warning("JWT decode failed: error_type=%s", type(e).__name__)
             return None
 
     def get_token_remaining_seconds(self, token: str = None) -> Optional[int]:
@@ -96,15 +96,13 @@ class HuarunGasApi:
         成功响应：
           {"success": true, "msg": "操作成功", "dataResult": {dict or list}}
         """
-        msg = data.get("msg", "")
+        msg = str(data.get("msg") or "")
         status_code = data.get("statusCode", "")
         data_result = data.get("dataResult")
 
         if "会话超时" in msg:
             return True
         if "SESSION_TIMEOUT" in str(status_code).upper():
-            return True
-        if "系统繁忙" in msg:
             return True
         if isinstance(data_result, str):
             if data_result.isdigit() and len(data_result) > 10:
@@ -163,7 +161,7 @@ class HuarunGasApi:
 
                 # 检测华润API的"假成功"错误响应
                 if self._is_session_timeout(data):
-                    raise SessionTimeoutError(f"{data.get('msg')} ({data.get('statusCode')})")
+                    raise SessionTimeoutError("会话超时")
 
                 return data
 
@@ -199,28 +197,27 @@ class HuarunGasApi:
 
                 data = await response.json()
 
-                _LOGGER.debug(f"刷新Token原始响应: {data}")
+                _LOGGER.debug("Token refresh response: data_type=%s", type(data).__name__)
 
                 if self._is_session_timeout(data):
-                    _LOGGER.error(f"Token刷新失败(会话超时): {data.get('msg')}")
-                    raise SessionTimeoutError(f"{data.get('msg')}")
+                    _LOGGER.error("Token refresh failed: session timeout")
+                    raise SessionTimeoutError("会话超时")
 
                 if not data.get("success"):
-                    _LOGGER.error(f"Token刷新失败: {data.get('msg')}")
-                    raise Exception(f"Token刷新失败: {data.get('msg')}")
+                    _LOGGER.error("Token refresh rejected")
+                    raise Exception("Token refresh rejected")
 
                 result = data.get("dataResult", {})
                 
                 if not isinstance(result, dict):
-                    _LOGGER.warning(f"Token刷新返回非字典: type={type(result).__name__}, val={str(result)[:100]}")
+                    _LOGGER.warning("Token refresh returned invalid data: data_type=%s", type(result).__name__)
                     return {}
 
                 new_refresh_token = result.get("refresh-token") or result.get("refreshToken")
                 new_bo_token = result.get("bo-token") or result.get("boToken")
                 new_wx_code = result.get("wxCode") or result.get("wxcode")
 
-                if new_refresh_token and new_bo_token:
-                    old_rt = self.refresh_token[:30] if len(self.refresh_token) > 30 else self.refresh_token
+                if isinstance(new_refresh_token, str) and new_refresh_token and isinstance(new_bo_token, str) and new_bo_token:
                     self.refresh_token = new_refresh_token
                     self.bo_token = new_bo_token
                     if new_wx_code:
@@ -232,13 +229,13 @@ class HuarunGasApi:
                     _LOGGER.info("Token刷新成功!")
                     return {"refresh-token": new_refresh_token, "bo-token": new_bo_token}
                 else:
-                    _LOGGER.warning(f"Token刷新缺少字段: keys={list(result.keys()) if isinstance(result, dict) else 'N/A'}")
+                    _LOGGER.warning("Token refresh missing required fields")
                     return {}
 
         except SessionTimeoutError:
             raise
         except Exception as e:
-            _LOGGER.error(f"Token刷新异常: {e}")
+            _LOGGER.error("Token refresh failed: error_type=%s", type(e).__name__)
             raise
 
     async def async_get_login_info(self) -> Dict[str, Any]:

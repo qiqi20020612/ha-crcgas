@@ -6,26 +6,27 @@
 
 import json
 import logging
-import sqlite3
-import time as time_mod
 from datetime import timedelta, datetime, timezone
 from typing import Any, Dict, Optional
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.event import async_call_later
-from homeassistant.helpers import entity_registry as er
 
 try:
-    from homeassistant.components.sensor import SensorEntity as BaseSensor
+    from homeassistant.components.sensor import SensorEntity as BaseSensor, RestoreSensor
 except ImportError:
     from homeassistant.helpers.entity import Entity as BaseSensor
+    RestoreSensor = BaseSensor
 
 from homeassistant.components.sensor.const import SensorStateClass as _SSC
 
 from .api import HuarunGasApi, SessionTimeoutError
+from .billing import _number
+from .data import bill_key, chart_values, parse_payment_time, previous_usage
+from .history_storage import async_setup_history_storage
 from .billing import (
     BILL_ATTRIBUTES,
     BILL_NUMERIC_FIELDS,
@@ -67,51 +68,17 @@ def _safe_float(value, default=0):
 _STATE_CLASS_MAP = {
     "this_read": _SSC.TOTAL_INCREASING,
     "total_gas_consumption": _SSC.TOTAL_INCREASING,
-    "total_gas_cost": _SSC.TOTAL_INCREASING,
-    "monthly_gas_used": _SSC.TOTAL_INCREASING,
-    "step1_gas_used": _SSC.TOTAL_INCREASING,
-    "step2_gas_used": _SSC.TOTAL_INCREASING,
-    "step3_gas_used": _SSC.TOTAL_INCREASING,
-    "annual_pay_count": _SSC.TOTAL_INCREASING,
     "gas_energy_dashboard": _SSC.TOTAL_INCREASING,
-    "account_balance": _SSC.MEASUREMENT,
-    "arrears": _SSC.MEASUREMENT,
-    "bill_amount": _SSC.MEASUREMENT,
-    "estimated_gas_bill_amount": _SSC.MEASUREMENT,
-    "gas_price_step1": _SSC.MEASUREMENT,
-    "gas_price_step2": _SSC.MEASUREMENT,
-    "gas_price_step3": _SSC.MEASUREMENT,
-    "last_month_gas": _SSC.TOTAL,
-    "last_pay_amount": _SSC.MEASUREMENT,
-    "penalties": _SSC.MEASUREMENT,
-    "penalty_amount": _SSC.MEASUREMENT,
-    "revbl_amount": _SSC.MEASUREMENT,
-    "step1_gas_limit": _SSC.MEASUREMENT,
-    "step1_gas_sum": _SSC.TOTAL,
-    "step1_remain": _SSC.MEASUREMENT,
-    "step2_gas_limit": _SSC.MEASUREMENT,
-    "step2_gas_sum": _SSC.TOTAL,
-    "step2_remain": _SSC.MEASUREMENT,
-    "step3_gas_sum": _SSC.TOTAL,
-    "step3_remain": _SSC.MEASUREMENT,
-    "this_gas_used": _SSC.TOTAL,
-    "year_avg_gas": _SSC.TOTAL,
-
+    "total_gas_cost": _SSC.TOTAL,
 }
-
-_DEVICE_CLASS_MAP = {
-    "this_read": "gas",
-    "total_gas_consumption": "gas",
-    "total_gas_cost": "monetary",
-    "monthly_gas_used": "gas",
-    "step1_gas_used": "gas",
-    "step2_gas_used": "gas",
-    "step3_gas_used": "gas",
-    "gas_energy_dashboard": "gas",
+_NUMERIC_FIELDS = set(BILL_NUMERIC_FIELDS) | {
+    "arrears", "account_balance", "last_pay_amount", "annual_pay_count",
+    "last_month_gas", "year_avg_gas", "total_gas_cost",
 }
+_METER_TOTALS = ("total_gas_consumption", "gas_energy_dashboard")
 
 
-class HuarunGasSensor(BaseSensor):
+class HuarunGasSensor(RestoreSensor):
     """华润燃气传感器基类"""
 
     def __init__(self, coordinator: DataUpdateCoordinator, sensor_type: str):
@@ -122,7 +89,7 @@ class HuarunGasSensor(BaseSensor):
         self._attr_icon = SENSOR_TYPES[sensor_type].get("icon")
         self._attr_native_unit_of_measurement = SENSOR_TYPES[sensor_type].get("unit")
         self._attr_state_class = _STATE_CLASS_MAP.get(sensor_type)
-        self._attr_device_class = _DEVICE_CLASS_MAP.get(sensor_type)
+        self._attr_device_class = SENSOR_TYPES[sensor_type].get("device_class")
         self._last_good_value = None
 
     @property
@@ -146,10 +113,26 @@ class HuarunGasSensor(BaseSensor):
         ):
             data = self.coordinator.data or {}
             return {key: data.get(key) for key in BILL_ATTRIBUTES}
+        if self.sensor_type in ("monthly_gas_used", "year_avg_gas", "last_month_gas"):
+            data = self.coordinator.data or {}
+            return {key: data.get(key) for key in (
+                "usage_period_type", "chart_month", "year_avg_year", "previous_bill_period",
+            )}
+        if self.sensor_type == "total_gas_cost":
+            return {"cost_basis": "issued_bills", "history_complete": (self.coordinator.data or {}).get("history_complete")}
+        if self.sensor_type == "integration_status":
+            return {"failed_endpoints": (self.coordinator.data or {}).get("failed_endpoints", [])}
         return None
 
     async def async_added_to_hass(self):
-        """添加到 Home Assistant"""
+        """Restore only valid physical totals; a legacy placeholder zero is not a baseline."""
+        await super().async_added_to_hass()
+        if self.sensor_type in _METER_TOTALS:
+            restored = await self.async_get_last_sensor_data()
+            if restored and restored.native_unit_of_measurement == "m³":
+                value = _number(restored.native_value)
+                if value is not None and value > 0:
+                    self._last_good_value = value
         self.async_on_remove(
             self.coordinator.async_add_listener(self.async_write_ha_state)
         )
@@ -161,14 +144,20 @@ class HuarunGasSensor(BaseSensor):
         """获取传感器值"""
         data = self.coordinator.data
         if not data:
-            if self.sensor_type in ("total_gas_consumption", "total_gas_cost"):
+            if self.sensor_type in (*_METER_TOTALS, "total_gas_cost"):
                 return self._last_good_value
             return None
 
-        if self.sensor_type in BILL_NUMERIC_FIELDS and data.get(self.sensor_type) is None:
-            return None
-        if self.sensor_type in ("total_gas_consumption", "gas_energy_dashboard") and data.get("this_read") is None:
+        if self.sensor_type in _METER_TOTALS:
+            value = _number(data.get("this_read"))
+            if value is not None and value >= 0:
+                self._last_good_value = value
             return self._last_good_value
+        if self.sensor_type in _NUMERIC_FIELDS:
+            value = _number(data.get(self.sensor_type))
+            if self.sensor_type == "total_gas_cost" and value is not None:
+                self._last_good_value = value
+            return value
 
         if self.sensor_type == "arrears":
             v = data.get("arrears")
@@ -283,7 +272,7 @@ class HuarunGasSensor(BaseSensor):
 
         elif self.sensor_type == "gas_nature":
             v = data.get("gas_nature")
-            return v if v and v != "未知" else "天然气"
+            return v if v and v != "未知" else "未知"
 
         elif self.sensor_type == "purchase_style":
             v = data.get("purchase_style")
@@ -431,302 +420,6 @@ class HuarunGasMeterHistorySensor(BaseSensor):
         )
         if self._coordinator.data is not None:
             self.async_write_ha_state()
-
-def _import_history_statistics(hass, entry, bill_history, current_reading=None):
-    """将历史账单数据导入 HA 统计系统，形成趋势图（增量：从DB已有累计值继续）"""
-    try:
-        from homeassistant.components.recorder.statistics import (
-            async_add_external_statistics,
-            StatisticMetaData,
-            StatisticMeanType,
-        )
-    except ImportError:
-        _LOGGER.warning("recorder 组件不可用，无法导入历史统计")
-        return
-
-    sorted_bills = sorted(bill_history, key=lambda b: b.get("billYm", ""))
-    if not sorted_bills:
-        return
-
-    from datetime import datetime, timezone
-    import sqlite3, os
-
-    db_path = os.path.join(hass.config.path(), "home-assistant_v2.db")
-    last_gas_sum = 0.0
-    last_bill_sum = 0.0
-    existing_months = set()
-    last_ts = 0
-
-    try:
-        db_conn = sqlite3.connect(db_path)
-        c = db_conn.cursor()
-
-        # Read existing data
-        meta_gas = c.execute("SELECT id FROM statistics_meta WHERE statistic_id='crcgas:monthly_gas_usage'").fetchone()
-        if meta_gas:
-            existing = c.execute("SELECT start_ts, sum FROM statistics WHERE metadata_id=?", (meta_gas[0],)).fetchall()
-            for ts, s in existing:
-                existing_months.add(datetime.fromtimestamp(ts).strftime("%Y-%m"))
-                if ts > last_ts:
-                    last_gas_sum = s
-                    last_ts = ts
-
-        meta_bill = c.execute("SELECT id FROM statistics_meta WHERE statistic_id='crcgas:monthly_bill_amount'").fetchone()
-        if meta_bill:
-            existing_bills = c.execute("SELECT start_ts, sum FROM statistics WHERE metadata_id=? ORDER BY start_ts DESC LIMIT 1", (meta_bill[0],)).fetchone()
-            if existing_bills:
-                last_bill_sum = existing_bills[1]
-
-        db_conn.close()
-    except Exception:
-        pass
-
-    # Find the last gas cumulative from the existing data
-    if existing_months:
-        # Use the existing last gas sum
-        pass  # last_gas_sum already set above
-
-    new_gas_stats = []
-    new_bill_stats = []
-    cumulative_gas = last_gas_sum
-    cumulative_bill = last_bill_sum
-
-    for bill in sorted_bills:
-        ym = bill.get("billYm", "")
-        if not ym or len(ym) < 7:
-            continue
-        if ym in existing_months:
-            # Skip existing months (already in statistics)
-            continue
-        year, month = int(ym[:4]), int(ym[5:7])
-        gas_amt = float(bill.get("gasAmt", 0) or 0)
-        bill_amt = float(bill.get("billAmt", 0) or 0)
-        cumulative_gas += gas_amt
-        cumulative_bill += bill_amt
-        start = datetime(year, month, 1, tzinfo=timezone.utc)
-
-        new_gas_stats.append({
-            "start": start, "state": gas_amt, "sum": cumulative_gas,
-            "min": gas_amt, "max": gas_amt, "mean": 0.0, "mean_weight": 0.0,
-            "last_reset": start,
-        })
-        new_bill_stats.append({
-            "start": start, "state": bill_amt, "sum": cumulative_bill,
-            "min": bill_amt, "max": bill_amt, "mean": 0.0, "mean_weight": 0.0,
-            "last_reset": start,
-        })
-
-    # Only inject if we have data
-    if new_gas_stats:
-        gas_metadata = StatisticMetaData(
-            has_mean=False, has_sum=True,
-            name="历史月度用气量", source=DOMAIN,
-            statistic_id=f"{DOMAIN}:monthly_gas_usage",
-            unit_of_measurement="m³",
-            mean_type=StatisticMeanType.NONE,
-        )
-        async_add_external_statistics(hass, gas_metadata, new_gas_stats)
-        _LOGGER.info("已导入 %d 条用气量统计（累计从 %.1f 开始）", len(new_gas_stats), last_gas_sum)
-
-    if new_bill_stats:
-        bill_metadata = StatisticMetaData(
-            has_mean=False, has_sum=True,
-            name="历史月度燃气费", source=DOMAIN,
-            statistic_id=f"{DOMAIN}:monthly_bill_amount",
-            unit_of_measurement="CNY",
-            mean_type=StatisticMeanType.NONE,
-        )
-        async_add_external_statistics(hass, bill_metadata, new_bill_stats)
-        _LOGGER.info("已导入 %d 条燃气费统计（累计从 %.1f 开始）", len(new_bill_stats), last_bill_sum)
-
-
-async def _import_meter_history_to_entity(hass, entry, bill_history, only_missing=False):
-    """通过 sqlite3 直接写入历史累计统计到 recorder 数据库
-    only_missing=True: 只检查数据库中是否有记录，无记录时才注入（启动时用，不删除已有数据）
-    only_missing=False: 先删后插（按钮触发时用）
-    """
-    import sqlite3
-    from datetime import datetime, timezone
-    import time as time_mod
-
-    history_unique_id = f"{DOMAIN}_total_gas_consumption"
-    entity_reg = er.async_get(hass)
-    entity_id = entity_reg.async_get_entity_id("sensor", DOMAIN, history_unique_id)
-    if not entity_id:
-        entity_id = "sensor.hua_run_ran_qi_ran_qi_zong_xiao_hao_liang"
-        _LOGGER.info("使用 fallback entity_id: %s", entity_id)
-
-    # 同时获取累计燃气费用传感器的ID
-    cost_history_unique_id = f"{DOMAIN}_total_gas_cost"
-    cost_entity_id = entity_reg.async_get_entity_id("sensor", DOMAIN, cost_history_unique_id)
-    # fallback: 如果 registry 还没注册，直接构造已知的 entity_id
-    if not cost_entity_id:
-        cost_entity_id = "sensor.hua_run_ran_qi_lei_ji_ran_qi_fei_yong"
-
-    sorted_bills = sorted(bill_history, key=lambda b: b.get("billYm", ""))
-    stats_data = []
-    cost_stats_data = []
-    cumulative = 0.0
-    cumulative_cost = 0.0
-    for bill in sorted_bills:
-        ym = bill.get("billYm", "")
-        if not ym or len(ym) < 7:
-            continue
-        year, month = int(ym[:4]), int(ym[5:7])
-        gas_amt = float(bill.get("gasAmt", 0) or 0)
-        cumulative += gas_amt
-        start_ts = datetime(year, month, 1, tzinfo=timezone.utc).timestamp()
-        stats_data.append((start_ts, cumulative))
-        # 费用累计
-        bill_amt = float(bill.get("billAmt", 0) or 0)
-        cumulative_cost += bill_amt
-        cost_stats_data.append((start_ts, cumulative_cost))
-
-    if not stats_data:
-        _LOGGER.warning("无账单数据，跳过历史累计注入")
-        return
-
-    db_path = hass.config.path("home-assistant_v2.db")
-    now = time_mod.time()
-
-    # 计算统一的 last_reset_ts：取最早的月份开始时间
-    common_reset_ts = stats_data[0][0] if stats_data else now
-
-    async def _inject_cost():
-        if not cost_entity_id or not cost_stats_data:
-            return
-
-        def _do_cost_inject():
-            conn2 = None
-            try:
-                conn2 = sqlite3.connect(db_path, timeout=10)
-                conn2.execute("PRAGMA journal_mode=WAL")
-                conn2.execute("BEGIN IMMEDIATE")
-
-                # 清理旧的 source=crcgas 残留
-                for old_id in [
-                    r[0] for r in conn2.execute(
-                        "SELECT id FROM statistics_meta WHERE statistic_id = ? AND source = ?",
-                        (cost_entity_id, DOMAIN),
-                    ).fetchall()
-                ]:
-                    conn2.execute("DELETE FROM statistics WHERE metadata_id = ?", (old_id,))
-                    conn2.execute("DELETE FROM statistics_meta WHERE id = ?", (old_id,))
-
-                conn2.execute(
-                    "INSERT OR IGNORE INTO statistics_meta "
-                    "(statistic_id, source, unit_of_measurement, has_mean, has_sum, name) "
-                    "VALUES (?, 'recorder', ?, 0, 1, '累计燃气费用')",
-                    (cost_entity_id, "¥"),
-                )
-                cost_row = conn2.execute(
-                    "SELECT id FROM statistics_meta WHERE statistic_id = ? AND source = 'recorder'",
-                    (cost_entity_id,),
-                ).fetchone()
-                if cost_row:
-                    cost_mid = cost_row[0]
-                    conn2.execute("DELETE FROM statistics WHERE metadata_id = ?", (cost_mid,))
-                    conn2.execute("DELETE FROM statistics_short_term WHERE metadata_id = ?", (cost_mid,))
-                    cost_rows = [(cost_mid, ts, val, val, val, val, 0.0, common_reset_ts, now) for ts, val in cost_stats_data]
-                    conn2.executemany(
-                        "INSERT INTO statistics "
-                        "(metadata_id, start_ts, state, sum, min, max, mean, last_reset_ts, created_ts) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        cost_rows,
-                    )
-                    _LOGGER.info("已注入 %d 条历史费用到 %s", len(cost_stats_data), cost_entity_id)
-                conn2.commit()
-            except sqlite3.Error as e:
-                _LOGGER.error("SQLite写入费用统计失败: %s", e)
-            except Exception as e:
-                _LOGGER.error("注入费用统计意外错误: %s", e)
-            finally:
-                if conn2:
-                    conn2.close()
-
-        await hass.async_add_executor_job(_do_cost_inject)
-
-    def _do_inject():
-        conn = None
-        try:
-            conn = sqlite3.connect(db_path, timeout=10)
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("BEGIN IMMEDIATE")
-
-            # === 注入燃气累计用量（总读数）===
-            if only_missing:
-                row = conn.execute(
-                    "SELECT id FROM statistics_meta WHERE statistic_id = ? AND source = 'recorder'",
-                    (entity_id,),
-                ).fetchone()
-                if row:
-                    existing = conn.execute(
-                        "SELECT COUNT(*) FROM statistics WHERE metadata_id = ?",
-                        (row[0],),
-                    ).fetchone()
-                    if existing and existing[0] >= 10:
-                        _LOGGER.info("已有 %d 条历史累计记录(气量)，跳过", existing[0])
-                        conn.rollback()
-                        return
-                _LOGGER.info("未发现历史累计记录，执行首次自动注入")
-
-            # 清理旧的 source=crcgas 残留
-            for old_id in [
-                r[0] for r in conn.execute(
-                    "SELECT id FROM statistics_meta WHERE statistic_id = ? AND source = ?",
-                    (entity_id, DOMAIN),
-                ).fetchall()
-            ]:
-                conn.execute("DELETE FROM statistics WHERE metadata_id = ?", (old_id,))
-                conn.execute("DELETE FROM statistics_meta WHERE id = ?", (old_id,))
-
-            conn.execute(
-                "INSERT OR IGNORE INTO statistics_meta "
-                "(statistic_id, source, unit_of_measurement, has_mean, has_sum, name) "
-                "VALUES (?, 'recorder', ?, 0, 1, '燃气表总读数')",
-                (entity_id, "m³"),
-            )
-
-            row = conn.execute(
-                "SELECT id FROM statistics_meta WHERE statistic_id = ? AND source = 'recorder'",
-                (entity_id,),
-            ).fetchone()
-            if row is None:
-                _LOGGER.error("无法获取 statistics_meta id（statistic_id=%s）", entity_id)
-                conn.rollback()
-                return
-
-            mid = row[0]
-            conn.execute("DELETE FROM statistics WHERE metadata_id = ?", (mid,))
-            conn.execute("DELETE FROM statistics_short_term WHERE metadata_id = ?", (mid,))
-
-            rows = [(mid, ts, val, val, val, val, 0.0, common_reset_ts, now) for ts, val in stats_data]
-            conn.executemany(
-                "INSERT INTO statistics "
-                "(metadata_id, start_ts, state, sum, min, max, mean, last_reset_ts, created_ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                rows,
-            )
-
-            conn.commit()
-            _LOGGER.info("已注入 %d 条历史累计到 %s", len(stats_data), entity_id)
-        except sqlite3.Error as e:
-            _LOGGER.error("SQLite 写入历史累计失败: %s", e)
-            if conn:
-                conn.rollback()
-        except Exception as e:
-            _LOGGER.error("注入历史累计时发生意外错误: %s", e)
-            if conn:
-                conn.rollback()
-        finally:
-            if conn:
-                conn.close()
-
-    await hass.async_add_executor_job(_do_inject)
-    await _inject_cost()
-
-
-
 
 async def async_setup_entry(
 
@@ -901,13 +594,25 @@ async def async_setup_entry(
         }
 
         # Missing billing data is unknown, never a synthetic zero or default tariff.
-        result.update({key: None for key in BILL_NUMERIC_FIELDS})
+        result.update({key: None for key in _NUMERIC_FIELDS})
         result.update({key: None for key in BILL_ATTRIBUTES})
-        bill_api_error = False
+        api_errors = []
+        bills = []
+        history = None
+        try:
+            history = await async_setup_history_storage(hass, config_entry.entry_id)
+        except Exception as exc:
+            api_errors.append("history_storage")
+            _LOGGER.warning("History load failed: error_type=%s", type(exc).__name__)
 
         session_timeout_count = 0
 
-        total_api_calls = 6
+        def failed(endpoint, exc):
+            nonlocal session_timeout_count
+            api_errors.append(endpoint)
+            if isinstance(exc, SessionTimeoutError):
+                session_timeout_count += 1
+            _LOGGER.warning("Data request failed: endpoint=%s, error_type=%s", endpoint, type(exc).__name__)
 
 
 
@@ -919,71 +624,68 @@ async def async_setup_entry(
 
             try:
 
-                await api.async_refresh_token()
+                if not await api.async_refresh_token():
+                    raise ValueError("Token refresh returned no credentials")
 
             except Exception as e:
 
-                _LOGGER.error(f"强制刷新Token失败: {e}")
+                failed("token_refresh", e)
 
 
 
-        # 1. 获取欠费信息
-
+        # 1. Balances are snapshots: missing and failed values stay unknown.
         try:
+            response = await api.async_query_arrears(cons_no)
+            if not bill_response_ok(response) or not isinstance(response.get("dataResult"), dict):
+                raise ValueError("Unsuccessful balance response")
+            data = response["dataResult"]
+            result["arrears"] = _number(data.get("totalAmt"))
+            result["account_balance"] = _number(data.get("totalBal"))
+            if result["arrears"] is None or result["account_balance"] is None:
+                raise ValueError("Missing balance fields")
+        except Exception as exc:
+            failed("arrears", exc)
 
-            arrears_data = await api.async_query_arrears(cons_no)
-
-            if arrears_data:
-
-                data = arrears_data.get("dataResult", {})
-
-                if isinstance(data, dict):
-
-                    result["arrears"] = float(data.get("totalAmt", 0) or 0)
-
-                    result["account_balance"] = float(data.get("totalBal", 0) or 0)
-
-        except Exception as e:
-
-            _LOGGER.error(f"获取欠费信息失败: {e}")
-
-            if "SESSION_TIMEOUT" in str(e) or "会话超时" in str(e):
-
-                session_timeout_count += 1
-
-
-
-        # 2. 获取缴费历史
-
+        # 2. Count only after all pages have succeeded. Keep a known latest payment
+        # if a later page fails, but never report a partial annual count.
         try:
-
-            pay_data = await api.async_query_pay_history(cons_no)
-
-            if pay_data and pay_data.get("success"):
-
-                pay_result = pay_data.get("dataResult", [])
-
-                if isinstance(pay_result, list) and pay_result:
-
-                    last_pay = pay_result[0]
-
-                    result["last_pay_time"] = last_pay.get("payTime", "未知")
-
-                    result["last_pay_amount"] = float(last_pay.get("payAmount", 0) or 0)
-
-                    current_year = str(datetime.now().year)
-
-                    result["annual_pay_count"] = sum(1 for p in pay_result if current_year in str(p.get("payTime", "")))
-
-        except Exception as e:
-
-            _LOGGER.error(f"获取缴费历史失败: {e}")
-
-            if "SESSION_TIMEOUT" in str(e) or "会话超时" in str(e):
-
-                session_timeout_count += 1
-
-
+            current_year = dt_util.now().year
+            seen_pages = set()
+            seen_payments = set()
+            count = 0
+            latest_time = ""
+            for page in range(1, 101):
+                response = await api.async_query_pay_history(cons_no, page=page, page_num=12)
+                if not bill_response_ok(response) or not isinstance(response.get("dataResult"), list):
+                    raise ValueError("Unsuccessful payment history response")
+                payments = response["dataResult"]
+                fingerprint = json.dumps(payments, sort_keys=True)
+                if payments and fingerprint in seen_pages:
+                    raise ValueError("Repeated payment history page")
+                seen_pages.add(fingerprint)
+                for payment in payments:
+                    if not isinstance(payment, dict) or not (stamp := parse_payment_time(payment.get("payTime"))):
+                        raise ValueError("Invalid payment date")
+                    identity = payment.get("id") or payment.get("payNo")
+                    if identity is not None:
+                        if identity in seen_payments:
+                            continue
+                        seen_payments.add(identity)
+                    if stamp.tzinfo is not None:
+                        stamp = dt_util.as_local(stamp).replace(tzinfo=None)
+                    time_key = stamp.isoformat()
+                    if time_key > latest_time:
+                        latest_time = time_key
+                        result["last_pay_time"] = payment["payTime"]
+                        result["last_pay_amount"] = _number(payment.get("payAmount"))
+                    count += stamp.year == current_year
+                if len(payments) < 12:
+                    result["annual_pay_count"] = count
+                    break
+            else:
+                raise ValueError("Payment pagination limit reached")
+        except Exception as exc:
+            failed("pay_history", exc)
 
         # 3. 获取账单列表（获取抄表日期和阶梯剩余气量）
 
@@ -1008,129 +710,21 @@ async def async_setup_entry(
                         raise ValueError("Unexpected bill entry shape")
                     result.update(parse_bill_summary(last_bill))
 
-                    # 保存新账单到历史存储（自动更新统计）
-                    try:
-                        from .history_storage import CRCGasHistoryStorage
-                        hs = CRCGasHistoryStorage(hass, config_entry.entry_id)
-                        await hs.async_load()
-                        existing_app_nos = {b["applicationNo"] for b in hs.get_bill_history(limit=999) if b.get("applicationNo")}
-                        new_bills = [b for b in bills if b.get("applicationNo") not in existing_app_nos]
-                        if new_bills:
-                            for nb in new_bills:
-                                await hs.async_add_bill_record(nb)
-                            _LOGGER.info(f"账单历史更新: 新增{len(new_bills)}条新账单")
-                            # 增量注入：只追加新月份
-                            try:
-                                from homeassistant.components.recorder.statistics import (
-                                    async_add_external_statistics, StatisticMetaData, StatisticMeanType)
-                                import sqlite3, os
-                                db_path = os.path.join(hass.config.path(), "home-assistant_v2.db")
-                                db_conn = sqlite3.connect(db_path)
-                                c = db_conn.cursor()
-                                
-                                # 获取最新累计值
-                                meta_gas = c.execute("SELECT id FROM statistics_meta WHERE statistic_id='crcgas:monthly_gas_usage'").fetchone()
-                                meta_bill = c.execute("SELECT id FROM statistics_meta WHERE statistic_id='crcgas:monthly_bill_amount'").fetchone()
-                                last_gas_sum = float(c.execute("SELECT sum FROM statistics WHERE metadata_id=? ORDER BY start_ts DESC LIMIT 1", (meta_gas[0],)).fetchone()[0]) if meta_gas else 0
-                                last_bill_sum = float(c.execute("SELECT sum FROM statistics WHERE metadata_id=? ORDER BY start_ts DESC LIMIT 1", (meta_bill[0],)).fetchone()[0]) if meta_bill else 0
-                                db_conn.close()
-                                
-                                for nb in new_bills:
-                                    ym = nb.get("billYm", "")
-                                    if len(ym) < 7: continue
-                                    year, month = int(ym[:4]), int(ym[5:7])
-                                    gas_amt = float(nb.get("gasAmt", 0) or 0)
-                                    bill_amt = float(nb.get("billAmt", 0) or 0)
-                                    start = datetime(year, month, 1, tzinfo=timezone.utc)
-                                    
-                                    last_gas_sum += gas_amt
-                                    last_bill_sum += bill_amt
-                                    
-                                    # 用气量
-                                    async_add_external_statistics(hass, StatisticMetaData(
-                                        has_mean=False, has_sum=True,
-                                        name="历史月度用气量", source="crcgas",
-                                        statistic_id="crcgas:monthly_gas_usage",
-                                        unit_of_measurement="m\u00b3",
-                                        mean_type=StatisticMeanType.NONE,
-                                    ), [{
-                                        "start": start, "state": gas_amt, "sum": last_gas_sum,
-                                        "min": gas_amt, "max": gas_amt, "mean": 0.0, "mean_weight": 0.0,
-                                        "last_reset": start,
-                                    }])
-                                    
-                                    # 费用
-                                    async_add_external_statistics(hass, StatisticMetaData(
-                                        has_mean=False, has_sum=True,
-                                        name="历史月度燃气费", source="crcgas",
-                                        statistic_id="crcgas:monthly_bill_amount",
-                                        unit_of_measurement="CNY",
-                                        mean_type=StatisticMeanType.NONE,
-                                    ), [{
-                                        "start": start, "state": bill_amt, "sum": last_bill_sum,
-                                        "min": bill_amt, "max": bill_amt, "mean": 0.0, "mean_weight": 0.0,
-                                        "last_reset": start,
-                                    }])
-                                    _LOGGER.info(f"增量注入: {ym} 用气={gas_amt}m\u00b3 累计={last_gas_sum}m\u00b3")
-                            except Exception as e_inc:
-                                _LOGGER.warning(f"增量注入失败: {e_inc}")
-                    except Exception as e_h:
-                        _LOGGER.debug(f"账单历史更新跳过: {e_h}")
             else:
                 raise ValueError("Unsuccessful bill list response")
 
         except Exception as e:
 
-            bill_api_error = True
-            _LOGGER.warning("getGasBillList failed: error_type=%s", type(e).__name__)
+            failed("bill_list", e)
 
-            if isinstance(e, SessionTimeoutError) or "SESSION_TIMEOUT" in str(e) or "会话超时" in str(e):
-
-                session_timeout_count += 1
-
-
-
-        # 4. 获取月度用气图表
-
+        # 4. Posting-month chart values are not interchangeable with billing periods.
         try:
-
-            chart_data = await api.async_get_gas_bill_list4chart(cons_no)
-
-            if chart_data and chart_data.get("success"):
-
-                dr = chart_data.get("dataResult", {})
-
-                if isinstance(dr, dict):
-
-                    last_gas = dr.get("lastGas", [])
-
-                    if len(last_gas) > 1:
-
-                        result["last_month_gas"] = last_gas[1]
-
-                    all_gas = [g for g in last_gas if g is not None]
-
-                    if all_gas:
-
-                        result["year_avg_gas"] = round(sum(all_gas) / len(all_gas), 1)
-
-                    # 统计本年累计用气（thisGas 前几个非空值之和）
-                    this_gas = dr.get("thisGas", [])
-                    valid_this = [g for g in this_gas if g is not None and g > 0]
-                    if valid_this:
-                        result["step1_gas_sum"] = sum(valid_this)
-                    else:
-                        result["step1_gas_sum"] = 0
-
-        except Exception as e:
-
-            _LOGGER.error(f"获取月度用气图表失败: {e}")
-
-            if "SESSION_TIMEOUT" in str(e) or "会话超时" in str(e):
-
-                session_timeout_count += 1
-
-
+            response = await api.async_get_gas_bill_list4chart(cons_no)
+            if not bill_response_ok(response) or not isinstance(response.get("dataResult"), dict):
+                raise ValueError("Unsuccessful chart response")
+            result.update(chart_values(response["dataResult"], dt_util.now()))
+        except Exception as exc:
+            failed("bill_chart", exc)
 
         # 5. 获取账单详情；列表金额/用量已就绪，详情失败也不清零。
         try:
@@ -1154,85 +748,52 @@ async def async_setup_entry(
                     bool(bill_ym), bool(app_no),
                 )
         except Exception as e:
-            bill_api_error = True
-            _LOGGER.warning("getBillDetail failed: error_type=%s", type(e).__name__)
-            if isinstance(e, SessionTimeoutError) or "SESSION_TIMEOUT" in str(e) or "会话超时" in str(e):
-                session_timeout_count += 1
+            failed("bill_detail", e)
 
-        # 6. 获取绑定信息
-
+        # 6. Match the configured account; do not borrow another binding's data.
         try:
+            response = await api.async_get_binding_cons()
+            if not bill_response_ok(response) or not isinstance(response.get("dataResult"), list):
+                raise ValueError("Unsuccessful binding response")
+            bindings = response["dataResult"]
+            matching = [c for c in bindings if isinstance(c, dict) and c.get("consNo") == cons_no]
+            if not matching and len(bindings) == 1 and isinstance(bindings[0], dict) and not bindings[0].get("consNo"):
+                matching = bindings
+            if not matching:
+                raise ValueError("Configured binding unavailable")
+            cons_info = matching[0]
+            for source, target in (
+                ("consAddr", "cons_addr"), ("orgName", "org_name"),
+                ("gasNature", "gas_nature"), ("purchaseGasStyle", "purchase_style"),
+                ("consName", "cons_name"), ("mobile", "mobile"),
+            ):
+                result[target] = cons_info.get(source) or "未知"
+        except Exception as exc:
+            failed("binding", exc)
 
-            binding_data = await api.async_get_binding_cons()
-
-            if binding_data and binding_data.get("success"):
-
-                cons_list = binding_data.get("dataResult", [])
-
-                if isinstance(cons_list, list) and cons_list:
-
-                    cons_info = cons_list[0]
-
-                    result["cons_addr"] = cons_info.get("consAddr", "未知")
-
-                    result["org_name"] = cons_info.get("orgName", "未知")
-
-                    result["gas_nature"] = cons_info.get("gasNature", "未知") or "天然气"
-
-                    result["purchase_style"] = cons_info.get("purchaseGasStyle", "未知")
-                    result["cons_name"] = cons_info.get("consName", "未知")
-                    result["mobile"] = cons_info.get("mobile", "未知")
-
-        except Exception as e:
-
-            _LOGGER.error(f"获取绑定信息失败: {e}")
-
-            if "SESSION_TIMEOUT" in str(e) or "会话超时" in str(e):
-
-                session_timeout_count += 1
-
-
-
-        if session_timeout_count >= total_api_calls:
-
-            _LOGGER.critical(f"全部{total_api_calls}个API返回会话超时！Token已完全失效。")
-
-            result["integration_status"] = "token_expired"
-
-        else:
-
-            # 简单状态判断
-
-            if session_timeout_count > 0:
-
-                result["integration_status"] = "token_expired"
-
-            else:
-
-                result["integration_status"] = "api_error" if bill_api_error else "normal"
-
-
-
-        # 设置月度累计用气量（暂时用本期用气量代替）
-
-        result["monthly_gas_used"] = result.get("this_gas_used", 0)
-
-
-
-        # Only API-provided tier usage/tariffs may produce an estimate.
         finalize_bill(result)
-
-        # 累计燃气费用 = 历史账单总和
+        # Merge complete bill identities, never replace history with a response page.
         try:
-            from .history_storage import CRCGasHistoryStorage
-            cost_store = CRCGasHistoryStorage(hass, config_entry.entry_id)
-            await cost_store.async_load()
-            cost_history = cost_store.get_bill_history(limit=999)
-            historical_cost = sum(float(b.get("billAmt", 0) or 0) for b in cost_history)
-            current_cost = float(result.get("estimated_gas_bill_amount", 0) or 0)
-            result["total_gas_cost"] = round(historical_cost + current_cost, 2)
-        except Exception:
-            result["total_gas_cost"] = result.get("total_gas_cost", 0.0)
+            if history is not None:
+                if bills:
+                    records = [dict(bill) for bill in bills if isinstance(bill, dict)]
+                    if records and result.get("bill_amount") is not None:
+                        records[0]["billAmt"] = result["bill_amount"]
+                    await history.async_merge_bill_records(records)
+                stored = history.get_bill_history(limit=None)
+                result["last_month_gas"], result["previous_bill_period"] = previous_usage(stored, result.get("_last_bill_ym"))
+                result["history_complete"] = history._data.get("last_fetch_complete")
+                result["total_gas_cost"] = history.get_issued_cost()
+                if stored and result["total_gas_cost"] is None and result["history_complete"] is not None:
+                    raise ValueError("Issued bill total is incomplete or decreased")
+        except Exception as exc:
+            result["total_gas_cost"] = None
+            failed("history_storage", exc)
+
+        result["integration_status"] = (
+            "token_expired" if session_timeout_count else "api_error" if api_errors else "normal"
+        )
+        result["failed_endpoints"] = sorted(set(api_errors))
 
         _LOGGER.debug(
             "数据更新完成: status=%s, bill_amount_available=%s, reading_available=%s",
@@ -1255,6 +816,7 @@ async def async_setup_entry(
         name=DOMAIN,
 
         update_method=async_update_data,
+        config_entry=config_entry,
 
         update_interval=scan_interval,
 
@@ -1288,217 +850,59 @@ async def async_setup_entry(
 
 
 
-    # 异步执行首次刷新 + 自动抓取历史记录
-
-    def _fix_statis_sum():
-        """修正短期统计冷启动 sum=0 问题"""
-        sensor_ids = [
-            "sensor.hua_run_ran_qi_ran_qi_zong_xiao_hao_liang",
-            "sensor.hua_run_ran_qi_lei_ji_ran_qi_fei_yong",
-        ]
-        db_path = hass.config.path("home-assistant_v2.db")
-        try:
-            with sqlite3.connect(db_path) as conn:
-                c = conn.cursor()
-                meta_fixed = 0
-                sum_fixed = 0
-                for sid in sensor_ids:
-                    meta = c.execute(
-                        "SELECT id, has_mean, has_sum FROM statistics_meta WHERE statistic_id = ?",
-                        (sid,),
-                    ).fetchone()
-                    if not meta:
-                        continue
-                    mid, hm, hs = meta[0], meta[1], meta[2]
-
-                    # ① 修复 statistics_meta 字段（has_mean/has_sum 不应为 null）
-                    if hm is None or hs is None:
-                        new_hm = 0 if hm is None else hm
-                        new_hs = 1 if hs is None else hs
-                        c.execute(
-                            "UPDATE statistics_meta SET has_mean=?, has_sum=? WHERE id=?",
-                            (new_hm, new_hs, mid),
-                        )
-                        meta_fixed += 1
-                        _LOGGER.info(
-                            "修正 statistics_meta: %s has_mean=%s→%s has_sum=%s→%s",
-                            sid, hm, new_hm, hs, new_hs,
-                        )
-
-                    # ② 修复 short_term sum
-                    latest = c.execute(
-                        "SELECT sum, state FROM statistics_short_term "
-                        "WHERE metadata_id = ? ORDER BY start_ts DESC LIMIT 1",
-                        (mid,),
-                    ).fetchone()
-                    if not latest:
-                        continue
-                    short_sum, state_val = float(latest[0]), float(latest[1])
-                    if state_val > 0 and abs(short_sum - state_val) > 0.01:
-                        c.execute(
-                            "UPDATE statistics_short_term SET sum = state WHERE metadata_id = ?",
-                            (mid,),
-                        )
-                        rows = c.rowcount
-                        sum_fixed += rows
-                        _LOGGER.info(
-                            "修正短期统计 sum: %s %.1f→%.1f (%d条)",
-                            sid, short_sum, state_val, rows,
-                        )
-
-                if meta_fixed or sum_fixed:
-                    conn.commit()
-                    if meta_fixed:
-                        _LOGGER.info("statistics_meta 修正完成: %d 条", meta_fixed)
-                    if sum_fixed:
-                        _LOGGER.info("短期统计 sum 修正完成: %d 条", sum_fixed)
-        except Exception as e:
-            _LOGGER.warning("统计修正异常: %s", e)
-
     async def async_initial_setup():
-
-        """首次初始化：先刷新传感器数据，再自动抓取历史记录"""
-
+        """Refresh and recover local bills; never modify Recorder on startup."""
         try:
-
             await coordinator.async_config_entry_first_refresh()
-
-            _LOGGER.info("首次传感器数据刷新完成")
-
-        except Exception as e:
-
-            _LOGGER.error(f"首次传感器数据刷新失败: {e}")
-
-            return
-
-        # 修正短期统计 sum 冷启动问题（立即执行，可能无记录）
-        try:
-            await hass.async_add_executor_job(_fix_statis_sum)
-        except Exception as e:
-            _LOGGER.warning("短期统计 sum 修正异常: %s", e)
-
-        # 5分钟后延时修正（等 recorder 编译完成后再查一次）
-        async def _fix_statis_deferred(_now):
-            _LOGGER.info("延时修正短期统计 sum（recorder 编译后）...")
-            await hass.async_add_executor_job(_fix_statis_sum)
-
-        async_call_later(hass, timedelta(seconds=300), _fix_statis_deferred)
-
-
-
-        # 导入历史数据到能源面板
-        try:
-            from .history_storage import CRCGasHistoryStorage
-            store = CRCGasHistoryStorage(hass, config_entry.entry_id)
-            await store.async_load()
-            bill_history = store.get_bill_history(limit=999)
-            if bill_history:
-                _LOGGER.info(f"历史数据注入: {len(bill_history)} 条账单")
-                await _import_meter_history_to_entity(hass, config_entry, bill_history, only_missing=True)
-                _LOGGER.info("历史数据注入完成")
-        except Exception as e:
-            _LOGGER.warning(f"历史数据注入失败（按钮可补救）: {e}")
-
-        # 自动抓取历史记录（仅限首次安装/无历史数据时）
-
-        try:
-
-            from .history_storage import async_setup_history_storage
-
             storage = await async_setup_history_storage(hass, config_entry.entry_id)
-
-
-
-            # 检查是否已有历史数据
-
-            bill_history = storage.get_bill_history()
-
-            if bill_history:
-
-                _LOGGER.debug(f"已有 {len(bill_history)} 条历史账单，跳过自动抓取")
-
-                return
-
-
-
-            _LOGGER.info("首次启动，自动抓取历史记录...")
-
-            result = await storage.async_fetch_all_bills(api, cons_no)
-
-            _LOGGER.info(
-
-                f"首次自动抓取完成: "
-
-                f"新增{result['new_bills']}条, "
-
-                f"更新{result['updated_bills']}条, "
-
-                f"总计{result['total_stored']}条"
-
-            )
-            # 抓取完成后立即注入统计（无需重启）
-            if result.get("total_stored", 0) > 0:
-                bill_history = storage.get_bill_history(limit=999)
-                if bill_history:
-                    try:
-                        await _import_meter_history_to_entity(hass, config_entry, bill_history, only_missing=True)
-                        _import_history_statistics(hass, config_entry, bill_history)
-                        _LOGGER.info(f"首次统计注入完成: {len(bill_history)}条账单")
-                    except Exception as e_inj:
-                        _LOGGER.warning(f"首次统计注入失败: {e_inj}")
-
-        except Exception as e:
-
-            _LOGGER.warning(f"首次自动抓取历史记录失败（按钮可补救）: {e}")
-
-
+            if not storage._data.get("last_fetch_complete"):
+                fetched = await storage.async_fetch_all_bills(api, cons_no)
+                data = dict(coordinator.data or {})
+                data["total_gas_cost"] = storage.get_issued_cost()
+                data["history_complete"] = fetched["complete"]
+                if fetched["complete"] and data["total_gas_cost"] is not None:
+                    remaining = set(data.get("failed_endpoints", [])) - {"history_storage", "history_fetch", "history_startup"}
+                    data["failed_endpoints"] = sorted(remaining)
+                    if data.get("integration_status") != "token_expired":
+                        data["integration_status"] = "api_error" if remaining else "normal"
+                if not fetched["complete"] and data.get("integration_status") != "token_expired":
+                    data["integration_status"] = "api_error"
+                    data["failed_endpoints"] = sorted(set(data.get("failed_endpoints", [])) | {"history_fetch"})
+                coordinator.async_set_updated_data(data)
+        except Exception as exc:
+            _LOGGER.warning("Initial local history refresh failed: error_type=%s", type(exc).__name__)
+            data = dict(coordinator.data or {})
+            if data.get("integration_status") != "token_expired":
+                data["integration_status"] = "api_error"
+            data["total_gas_cost"] = None
+            data["failed_endpoints"] = sorted(set(data.get("failed_endpoints", [])) | {"history_startup"})
+            coordinator.async_set_updated_data(data)
 
     hass.async_create_task(async_initial_setup())
 
-    
-
-    # 注册服务：抓取历史记录
-
     async def async_fetch_history_service(call):
-
-        """服务：抓取所有历史账单"""
-
-        _LOGGER.info("服务触发: 抓取所有历史记录")
-
-        from .history_storage import async_setup_history_storage
-
-        
-
+        """Fetch local history only; no external or entity statistics are injected."""
         storage = await async_setup_history_storage(hass, config_entry.entry_id)
+        fetched = await storage.async_fetch_all_bills(api, cons_no)
+        await coordinator.async_request_refresh()
+        if not fetched["complete"]:
+            raise RuntimeError("History fetch incomplete; saved records retained")
+        return {"success": fetched["complete"], "result": fetched, "statistics_imported": False}
 
-        try:
+    hass.data[DOMAIN][f"{config_entry.entry_id}_fetch_history"] = async_fetch_history_service
 
-            result = await storage.async_fetch_all_bills(api, cons_no)
+    async def dispatch_history_service(call):
+        entry_id = call.data.get("config_entry_id")
+        handlers = {
+            key.removesuffix("_fetch_history"): value
+            for key, value in hass.data[DOMAIN].items() if key.endswith("_fetch_history")
+        }
+        if entry_id is None:
+            if len(handlers) != 1:
+                raise ValueError("Specify config_entry_id")
+            entry_id = next(iter(handlers))
+        if entry_id not in handlers:
+            raise ValueError("Unknown config_entry_id")
+        return await handlers[entry_id](call)
 
-            _LOGGER.info(
-
-                f"历史记录抓取完成: "
-
-                f"新增{result['new_bills']}条, "
-
-                f"更新{result['updated_bills']}条, "
-
-                f"总计{result['total_stored']}条"
-
-            )
-
-            return {"success": True, "result": result}
-
-        except Exception as e:
-
-            _LOGGER.error(f"抓取历史记录失败: {e}")
-
-            return {"success": False, "error": str(e)}
-
-    
-
-    hass.services.async_register(DOMAIN, "fetch_history", async_fetch_history_service)
-
-    _LOGGER.info(f"已注册服务: {DOMAIN}.fetch_history")
-
-
+    hass.services.async_register(DOMAIN, "fetch_history", dispatch_history_service)

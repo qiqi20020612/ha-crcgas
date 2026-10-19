@@ -8,6 +8,8 @@ The real sensor setup, coordinator update callback and entity properties execute
 import importlib
 import importlib.util
 import logging
+from copy import deepcopy
+from datetime import datetime, timezone
 import sys
 import types
 import unittest
@@ -79,67 +81,118 @@ def sensor_environment():
 
     class Coordinator:
         def __init__(self, hass, logger, **kwargs):
+            self.config_entry = kwargs.get("config_entry")
             self.update_method = kwargs["update_method"]
             self.data = None
             self.last_update_success = True
+            self.hass = hass
+
+        async def async_config_entry_first_refresh(self):
+            self.data = await self.update_method()
+
+        async def async_request_refresh(self):
+            self.data = await self.update_method()
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+        def async_add_listener(self, callback):
+            return lambda: None
+
+    class Sensor:
+        async def async_added_to_hass(self):
+            pass
+
+        async def async_get_last_sensor_data(self):
+            return None
+
+        def async_on_remove(self, callback):
+            pass
+
+        def async_write_ha_state(self):
+            pass
 
     class Storage:
         def __init__(self, hass, entry_id):
-            self.records = hass.history_records
+            self.records = deepcopy([r for r in (hass.history_records or []) if isinstance(r, dict)])
+            self._data = {"last_fetch_complete": True}
 
         async def async_load(self):
             pass
 
-        def get_bill_history(self, limit=999):
+        def get_bill_history(self, limit=None):
             return self.records
 
-        async def async_add_bill_record(self, record):
-            raise AssertionError("Current-bill tests must not write history or Recorder")
+        async def async_merge_bill_records(self, records):
+            from custom_components.crcgas.data import bill_key
+            indexed = {bill_key(b): b for b in self.records}
+            for record in records:
+                key = bill_key(record)
+                if key in indexed:
+                    indexed[key].update(record)
+                else:
+                    self.records.append(dict(record))
+
+        def get_issued_cost(self):
+            from custom_components.crcgas.data import issued_cost
+            return issued_cost(self.records)
+
+    async def history_storage(hass, entry_id):
+        key = f"{entry_id}_history_storage"
+        if key not in hass.data["crcgas"]:
+            hass.data["crcgas"][key] = Storage(hass, entry_id)
+        return hass.data["crcgas"][key]
 
     module("custom_components", __path__=[str(COMPONENT.parent)])
     module("custom_components.crcgas", __path__=[str(COMPONENT)])
     module("custom_components.crcgas.api", HuarunGasApi=object, SessionTimeoutError=SessionTimeoutError)
-    module("custom_components.crcgas.history_storage", CRCGasHistoryStorage=Storage)
+    module("custom_components.crcgas.history_storage", CRCGasHistoryStorage=Storage, async_setup_history_storage=history_storage)
     module("homeassistant")
     module("homeassistant.config_entries", ConfigEntry=object)
     module("homeassistant.core", HomeAssistant=object)
     module("homeassistant.const", Platform=types.SimpleNamespace(SENSOR="sensor", BUTTON="button"))
+    module("homeassistant.util")
+    module("homeassistant.util.dt", now=lambda: datetime(2026, 10, 19, tzinfo=timezone.utc), as_local=lambda value: value.astimezone(timezone.utc))
     module("homeassistant.helpers")
     module("homeassistant.helpers.update_coordinator", DataUpdateCoordinator=Coordinator)
     module("homeassistant.helpers.aiohttp_client", async_get_clientsession=lambda hass: None)
     module("homeassistant.helpers.event", async_call_later=lambda *args: None)
     module("homeassistant.helpers.entity_registry")
     module("homeassistant.components")
-    module("homeassistant.components.sensor", SensorEntity=object)
+    module("homeassistant.components.sensor", SensorEntity=Sensor, RestoreSensor=Sensor)
     module("homeassistant.components.sensor.const", SensorStateClass=types.SimpleNamespace(
         TOTAL_INCREASING="total_increasing", TOTAL="total", MEASUREMENT="measurement",
     ))
     # Avoid reusing sensor modules from a previous isolated test environment.
     with patch.dict(sys.modules, modules):
-        for suffix in ("sensor", "billing", "const"):
+        for suffix in ("sensor", "billing", "const", "data"):
             sys.modules.pop(f"custom_components.crcgas.{suffix}", None)
         yield importlib.import_module("custom_components.crcgas.sensor")
 
 
-async def setup_sensor(sensor, bills=None, details=None, chart=None):
+async def setup_sensor(sensor, bills=None, details=None, chart=None, tasks=None):
     """Construct a real update callback without running startup history jobs."""
     bills = bill_list() if bills is None else bills
     details = single_detail() if details is None else details
     api = types.SimpleNamespace(
         is_token_expiring_soon=lambda **kwargs: False,
-        async_query_arrears=AsyncMock(return_value=success({})),
+        async_query_arrears=AsyncMock(return_value=success({"totalAmt": 0, "totalBal": 0})),
         async_query_pay_history=AsyncMock(return_value=success([])),
         async_get_gas_bill_list=AsyncMock(return_value=bills),
         async_get_bill_detail=AsyncMock(return_value=details),
-        async_get_gas_bill_list4chart=AsyncMock(return_value=chart or success({})),
-        async_get_binding_cons=AsyncMock(return_value=success([])),
+        async_get_gas_bill_list4chart=AsyncMock(return_value=chart or success({"thisGas": [None] * 12, "lastGas": [None] * 12})),
+        async_get_binding_cons=AsyncMock(return_value=success([{"consNo": "synthetic-cons"}])),
     )
     entry = types.SimpleNamespace(entry_id="test-entry", data={"cons_no": "synthetic-cons"}, options={})
     records = bills.get("dataResult", {}).get("data", []) if isinstance(bills, dict) and isinstance(bills.get("dataResult"), dict) else []
+    registered = {}
     hass = types.SimpleNamespace(
         data={"crcgas": {"test-entry_api": api}}, history_records=records,
-        async_create_task=lambda coroutine: coroutine.close(),
-        services=types.SimpleNamespace(async_register=lambda *args: None),
+        async_create_task=lambda coroutine: coroutine.close() if tasks is None else tasks.append(coroutine),
+        services=types.SimpleNamespace(
+            async_register=lambda domain, name, handler: registered.__setitem__(name, handler),
+            registered=registered,
+        ),
     )
     entities = []
     await sensor.async_setup_entry(hass, entry, entities.extend)
@@ -374,9 +427,10 @@ class BillingRegressionTests(unittest.IsolatedAsyncioTestCase):
         chart = success({"lastGas": [None, 0, 80] + [None] * 9, "thisGas": [8] + [None] * 11})
         data, api, entities = await self.refresh(chart=chart)
         api.async_get_gas_bill_list4chart.assert_awaited_once_with("synthetic-cons")
-        self.assertEqual(data["year_avg_gas"], 40)
-        self.assertEqual(entities["last_month_gas"].native_value, 0)
-        self.assertEqual(data["monthly_gas_used"], 8)
+        self.assertIsNone(data["year_avg_gas"])
+        self.assertIsNone(entities["last_month_gas"].native_value)
+        self.assertIsNone(data["monthly_gas_used"])
+        self.assertEqual(data["usage_period_type"], "billing_month")
 
     async def test_usage_can_fall_back_to_complete_step_lines(self):
         data, _, _ = await self.refresh(bill_list(gasAmt=None), single_detail(gasUsed=None))

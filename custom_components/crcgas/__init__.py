@@ -54,12 +54,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         try:
             remaining = api.get_token_remaining_seconds()
             _LOGGER.info(f"独立定时器[整点]: 开始刷新Token，当前剩余{remaining}秒")
-            await api.async_refresh_token()
+            if not await api.async_refresh_token():
+                raise ValueError("Token refresh returned no credentials")
             _LOGGER.info("独立定时器[整点]: Token刷新成功")
         except SessionTimeoutError:
             _LOGGER.error("独立定时器[整点]: Token刷新失败(会话超时)，Token已完全失效，需要重新登录")
         except Exception as e:
-            _LOGGER.error(f"独立定时器[整点]: Token刷新异常: {e}")
+            _LOGGER.error("Token timer failed: error_type=%s", type(e).__name__)
 
     async def _async_refresh_token_urgent(now=None):
         """紧急刷新回调：Token 剩余时间不足5分钟时刷新"""
@@ -69,12 +70,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if remaining is None or remaining >= threshold_seconds:
                 return
             _LOGGER.info(f"独立定时器[紧急]: Token剩余{remaining}秒(<{threshold_seconds}秒)，立即刷新...")
-            await api.async_refresh_token()
+            if not await api.async_refresh_token():
+                raise ValueError("Token refresh returned no credentials")
             _LOGGER.info("独立定时器[紧急]: Token刷新成功")
         except SessionTimeoutError:
             _LOGGER.error("独立定时器[紧急]: Token刷新失败(会话超时)，Token已完全失效，需要重新登录")
         except Exception as e:
-            _LOGGER.error(f"独立定时器[紧急]: Token刷新异常: {e}")
+            _LOGGER.error("Urgent token timer failed: error_type=%s", type(e).__name__)
 
     cancel_timer_hourly = async_track_time_interval(
         hass,
@@ -115,4 +117,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(entry.entry_id, None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_coordinator", None)
         hass.data[DOMAIN].pop(f"{entry.entry_id}_api", None)
+        for suffix in ("history_storage", "fetch_history", "cons_no"):
+            hass.data[DOMAIN].pop(f"{entry.entry_id}_{suffix}", None)
     return unload_ok

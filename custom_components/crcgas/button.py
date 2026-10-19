@@ -71,13 +71,14 @@ class FetchHistoryButton(ButtonEntity):
         """按钮按下时触发"""
         _LOGGER.info("用户触发: 抓取所有历史记录")
 
-        # 调用已注册的 crcgas.fetch_history 服务（它包含统计导入逻辑）
+        # 只抓取本地账单；不改写 Recorder，且明确路由到本配置条目。
         try:
             await self.hass.services.async_call(
-                DOMAIN, "fetch_history", {}, blocking=True
+                DOMAIN, "fetch_history", {"config_entry_id": self.config_entry.entry_id}, blocking=True
             )
         except Exception as e:
-            _LOGGER.error(f"抓取历史记录失败: {e}")
+            _LOGGER.error("History fetch failed: error_type=%s", type(e).__name__)
+            raise
 
 
 class RefreshDataButton(ButtonEntity):
