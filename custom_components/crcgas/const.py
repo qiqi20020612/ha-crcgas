@@ -47,17 +47,15 @@ SENSOR_TYPES = {
     # === 高价值 ===
     "arrears": {
         "name": "欠费金额",
-        "unit": "¥",
+        "unit": "CNY",
         "icon": "mdi:cash",
         "device_class": "monetary",
-        "state_class": "total_increasing",
     },
     "account_balance": {
         "name": "燃气账户余额",
-        "unit": "¥",
+        "unit": "CNY",
         "icon": "mdi:wallet",
         "device_class": "monetary",
-        "state_class": "total_increasing",
     },
     "last_pay_time": {
         "name": "最近缴费时间",
@@ -65,10 +63,9 @@ SENSOR_TYPES = {
     },
     "last_pay_amount": {
         "name": "最近缴费金额",
-        "unit": "¥",
+        "unit": "CNY",
         "icon": "mdi:cash-multiple",
         "device_class": "monetary",
-        "state_class": "total_increasing",
     },
     "annual_pay_count": {
         "name": "年度缴费次数",
@@ -90,48 +87,41 @@ SENSOR_TYPES = {
         "unit": "m³",
         "icon": "mdi:stairs-up",
         "device_class": "gas",
-        "state_class": "total_increasing",
     },
     "step2_gas_used": {
         "name": "本期二阶梯用气量",
         "unit": "m³",
         "icon": "mdi:stairs-up",
         "device_class": "gas",
-        "state_class": "total_increasing",
     },
     # 单价（元/立方米）
     "gas_price_step1": {
         "name": "一阶梯气价",
-        "unit": "¥/m³",
+        "unit": "CNY/m³",
         "icon": "mdi:currency-cny",
-        "device_class": "monetary",
     },
     "gas_price_step2": {
         "name": "二阶梯气价",
-        "unit": "¥/m³",
+        "unit": "CNY/m³",
         "icon": "mdi:currency-cny",
-        "device_class": "monetary",
     },
     "estimated_gas_bill_amount": {
         "name": "预估燃气账单",
-        "unit": "¥",
+        "unit": "CNY",
         "icon": "mdi:calculator",
         "device_class": "monetary",
-        "state_class": "total_increasing",
     },
     "this_gas_used": {
         "name": "本期用气量",
         "unit": "m³",
         "icon": "mdi:fire",
         "device_class": "gas",
-        "state_class": "total_increasing",
     },
     "bill_amount": {
         "name": "账单金额",
-        "unit": "¥",
+        "unit": "CNY",
         "icon": "mdi:receipt",
         "device_class": "monetary",
-        "state_class": "total_increasing",
     },
     "step1_remain": {
         "name": "一阶梯剩余气量",
@@ -148,21 +138,18 @@ SENSOR_TYPES = {
         "unit": "m³",
         "icon": "mdi:sigma",
         "device_class": "gas",
-        "state_class": "total_increasing",
     },
     "step2_gas_sum": {
         "name": "二阶梯累计已用",
         "unit": "m³",
         "icon": "mdi:sigma",
         "device_class": "gas",
-        "state_class": "total_increasing",
     },
     "step3_gas_used": {
         "name": "本期三阶梯用气量",
         "unit": "m³",
         "icon": "mdi:stairs-up",
         "device_class": "gas",
-        "state_class": "total_increasing",
     },
     "step3_remain": {
         "name": "三阶梯剩余气量",
@@ -174,20 +161,17 @@ SENSOR_TYPES = {
         "unit": "m³",
         "icon": "mdi:sigma",
         "device_class": "gas",
-        "state_class": "total_increasing",
     },
     "gas_price_step3": {
         "name": "三阶梯气价",
-        "unit": "¥/m³",
+        "unit": "CNY/m³",
         "icon": "mdi:currency-cny",
-        "device_class": "monetary",
     },
     "penalty_amount": {
         "name": "违约金",
-        "unit": "¥",
+        "unit": "CNY",
         "icon": "mdi:alert-circle",
         "device_class": "monetary",
-        "state_class": "total_increasing",
     },
     # === 新增：犯态传感器 ===
     "integration_status": {
@@ -208,7 +192,6 @@ SENSOR_TYPES = {
         "unit": "m³",
         "icon": "mdi:chart-line",
         "device_class": "gas",
-        "state_class": "total_increasing",
     },
     # === 中等价值 ===
     "cons_addr": {
@@ -232,14 +215,12 @@ SENSOR_TYPES = {
         "unit": "m³",
         "icon": "mdi:chart-bar",
         "device_class": "gas",
-        "state_class": "total_increasing",
     },
     "year_avg_gas": {
-        "name": "年度月均用气量",
+        "name": "上年度账单月均用气量",
         "unit": "m³",
         "icon": "mdi:chart-line-variant",
         "device_class": "gas",
-        "state_class": "total_increasing",
     },
     "cons_name": {
         "name": "户名",
@@ -266,7 +247,6 @@ SENSOR_TYPES = {
         "unit": "m³",
         "icon": "mdi:gauge",
         "device_class": "gas",
-        "state_class": "total_increasing",
     },
     "last_read_time": {
         "name": "上期抄表时间",
@@ -278,17 +258,16 @@ SENSOR_TYPES = {
     },
     "revbl_amount": {
         "name": "应收金额",
-        "unit": "¥",
+        "unit": "CNY",
         "icon": "mdi:cash-clock",
         "device_class": "monetary",
-        "state_class": "total_increasing",
     },
     "penalty_date": {
         "name": "违约金起算日期",
         "icon": "mdi:calendar-alert",
     },
     "last_fetch_time": {
-        "name": "数据撤取时间",
+        "name": "数据抓取时间",
         "icon": "mdi:clock-digital",
     },
     "bill_month": {
@@ -306,7 +285,7 @@ SENSOR_TYPES = {
     },
     "total_gas_cost": {
         "name": "累计燃气费用",
-        "unit": "¥",
+        "unit": "CNY",
         "icon": "mdi:cash-multiple",
         "device_class": "monetary",
         "state_class": "total",
