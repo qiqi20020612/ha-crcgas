@@ -26,6 +26,15 @@ except ImportError:
 from homeassistant.components.sensor.const import SensorStateClass as _SSC
 
 from .api import HuarunGasApi, SessionTimeoutError
+from .billing import (
+    BILL_ATTRIBUTES,
+    BILL_NUMERIC_FIELDS,
+    bill_response_ok,
+    finalize_bill,
+    parse_bill_detail,
+    parse_bill_summary,
+    parse_price_info,
+)
 from .const import (
     CONF_BO_TOKEN,
     CONF_CONS_NO,
@@ -128,6 +137,17 @@ class HuarunGasSensor(BaseSensor):
     def available(self) -> bool:
         return self.coordinator.last_update_success
 
+    @property
+    def extra_state_attributes(self):
+        """Keep official tariffs separate from a bill's calculated average."""
+        if self.sensor_type in (
+            "bill_amount", "this_gas_used", "gas_price_step1",
+            "gas_price_step2", "gas_price_step3",
+        ):
+            data = self.coordinator.data or {}
+            return {key: data.get(key) for key in BILL_ATTRIBUTES}
+        return None
+
     async def async_added_to_hass(self):
         """添加到 Home Assistant"""
         self.async_on_remove(
@@ -144,6 +164,11 @@ class HuarunGasSensor(BaseSensor):
             if self.sensor_type in ("total_gas_consumption", "total_gas_cost"):
                 return self._last_good_value
             return None
+
+        if self.sensor_type in BILL_NUMERIC_FIELDS and data.get(self.sensor_type) is None:
+            return None
+        if self.sensor_type in ("total_gas_consumption", "gas_energy_dashboard") and data.get("this_read") is None:
+            return self._last_good_value
 
         if self.sensor_type == "arrears":
             v = data.get("arrears")
@@ -166,12 +191,7 @@ class HuarunGasSensor(BaseSensor):
             return float(v) if v is not None else 0.0
 
         elif self.sensor_type == "this_read":
-            v = data.get("this_read")
-            val = float(v) if v is not None else 0.0
-            if val > 0:
-                self._last_good_value = val
-                return val
-            return self._last_good_value if self._last_good_value is not None else 0.0
+            return float(data["this_read"])
 
         elif self.sensor_type == "total_gas_consumption":
             v = data.get("this_read")
@@ -411,50 +431,6 @@ class HuarunGasMeterHistorySensor(BaseSensor):
         )
         if self._coordinator.data is not None:
             self.async_write_ha_state()
-
-async def _calculate_step_usage(result, api, cons_no):
-
-    """计算阶梯用气量（备用方案）- 使用本月用气量"""
-
-    try:
-
-        this_gas_used = result.get("this_gas_used", 0)
-
-        step1_remain = result.get("step1_remain", 0)
-
-        step2_remain = result.get("step2_remain", 0)
-
-        step1_gas_limit = result.get("step1_gas_limit", 330)
-
-        step2_gas_limit = result.get("step2_gas_limit", 170)
-
-        
-
-        if step1_remain > 0:
-
-            # 所有用气量都在第一档
-
-            result["step1_gas_used"] = this_gas_used
-
-            result["step2_gas_used"] = 0
-
-        else:
-
-            # 部分用气量进入第二档
-
-            result["step1_gas_used"] = min(this_gas_used, step1_gas_limit)
-
-            result["step2_gas_used"] = max(0, this_gas_used - step1_gas_limit)
-
-        
-
-        _LOGGER.info(f"计算本月阶梯用气量: 本期={this_gas_used}, 一档={result['step1_gas_used']}, 二档={result['step2_gas_used']}")
-
-    except Exception as e:
-
-        _LOGGER.error(f"计算阶梯用气量失败: {e}")
-
-
 
 def _import_history_statistics(hass, entry, bill_history, current_reading=None):
     """将历史账单数据导入 HA 统计系统，形成趋势图（增量：从DB已有累计值继续）"""
@@ -924,6 +900,11 @@ async def async_setup_entry(
 
         }
 
+        # Missing billing data is unknown, never a synthetic zero or default tariff.
+        result.update({key: None for key in BILL_NUMERIC_FIELDS})
+        result.update({key: None for key in BILL_ATTRIBUTES})
+        bill_api_error = False
+
         session_timeout_count = 0
 
         total_api_calls = 6
@@ -1010,70 +991,22 @@ async def async_setup_entry(
 
             bill_data = await api.async_get_gas_bill_list(cons_no, page=1, page_num=6)
 
-            if bill_data and bill_data.get("success"):
-
-                data_result = bill_data.get("dataResult", {})
-
-                bills = data_result.get("data", []) if isinstance(data_result, dict) else []
-
-                cons_prc_info = data_result.get("consPrcInfo", {}) if isinstance(data_result, dict) else {}
-
-                prc_detail_list = cons_prc_info.get("consPrcDetailList", [])
-
-                for prc_detail in prc_detail_list:
-
-                    rule_code = prc_detail.get("ruleCode", "")
-
-                    lev_gq_remain = prc_detail.get("levGqRemain", "")
-                    lev_gq_sum = prc_detail.get("levGqSum", "0")
-
-                    if isinstance(lev_gq_remain, str):
-                        lev_gq_remain = lev_gq_remain.replace(",", "")
-
-                    if rule_code == "0201":
-
-                        result["step1_remain"] = _safe_float(lev_gq_remain) if lev_gq_remain else 0
-
-                        result["step1_gas_limit"] = _safe_float(prc_detail.get("levGq", 0))
-
-                        result["step1_price"] = _safe_float(prc_detail.get("catPrc", 0))
-
-                        result["gas_price_step1"] = _safe_float(prc_detail.get("catPrc", 0))
-
-                    elif rule_code == "0202":
-
-                        result["step2_remain"] = _safe_float(lev_gq_remain) if lev_gq_remain else 0
-
-                        result["step2_gas_limit"] = _safe_float(prc_detail.get("levGq", 0))
-
-                        result["step2_price"] = _safe_float(prc_detail.get("catPrc", 0))
-
-                        result["gas_price_step2"] = _safe_float(prc_detail.get("catPrc", 0))
-                        result["step2_gas_sum"] = _safe_float(lev_gq_sum) if lev_gq_sum else 0
-
-                    elif rule_code == "0203":
-
-                        result["gas_price_step3"] = _safe_float(prc_detail.get("catPrc", 0))
-                        result["step3_remain"] = _safe_float(lev_gq_remain) if lev_gq_remain else 0
-                        result["step3_gas_limit"] = _safe_float(prc_detail.get("levGq", 0))
-                        result["step3_gas_sum"] = _safe_float(lev_gq_sum) if lev_gq_sum else 0
-
+            if bill_response_ok(bill_data):
+                data_result = bill_data.get("dataResult")
+                if not isinstance(data_result, dict) or not isinstance(data_result.get("data"), list):
+                    raise ValueError("Unexpected bill list shape")
+                bills = data_result["data"]
+                _LOGGER.debug(
+                    "getGasBillList parsed: bills=%d, price_info_type=%s",
+                    len(bills), type(data_result.get("consPrcInfo")).__name__,
+                )
+                result.update(parse_price_info(data_result.get("consPrcInfo")))
                 if bills:
 
                     last_bill = bills[0]
-
-                    result["_last_bill_ym"] = last_bill.get("billYm", "")
-
-                    result["_last_app_no"] = last_bill.get("applicationNo", "")
-
-                    result["last_bill_gas_amt"] = float(last_bill.get("gasAmt", 0) or 0)
-
-                    result["last_bill_penalty"] = float(last_bill.get("penaltyAmt", 0) or 0)
-
-                    result["settle_flag"] = last_bill.get("settleFlag", "未知")
-                    result["revbl_amount"] = float(last_bill.get("revblAmt", 0) or 0)
-                    result["penalty_date"] = last_bill.get("penaltyDate", "未知")
-                    result["bill_month"] = last_bill.get("billYm", "未知")
+                    if not isinstance(last_bill, dict):
+                        raise ValueError("Unexpected bill entry shape")
+                    result.update(parse_bill_summary(last_bill))
 
                     # 保存新账单到历史存储（自动更新统计）
                     try:
@@ -1143,12 +1076,15 @@ async def async_setup_entry(
                                 _LOGGER.warning(f"增量注入失败: {e_inc}")
                     except Exception as e_h:
                         _LOGGER.debug(f"账单历史更新跳过: {e_h}")
+            else:
+                raise ValueError("Unsuccessful bill list response")
 
         except Exception as e:
 
-            _LOGGER.error(f"获取账单列表失败: {e}")
+            bill_api_error = True
+            _LOGGER.warning("getGasBillList failed: error_type=%s", type(e).__name__)
 
-            if "SESSION_TIMEOUT" in str(e) or "会话超时" in str(e):
+            if isinstance(e, SessionTimeoutError) or "SESSION_TIMEOUT" in str(e) or "会话超时" in str(e):
 
                 session_timeout_count += 1
 
@@ -1196,93 +1132,32 @@ async def async_setup_entry(
 
 
 
-        # 5. 获取账单详情（本期读数、用气量、账单金额）
-
+        # 5. 获取账单详情；列表金额/用量已就绪，详情失败也不清零。
         try:
-
-            bill_ym = result.get("_last_bill_ym", "")
-
-            app_no = result.get("_last_app_no", "")
-
+            bill_ym = result.get("_last_bill_ym")
+            app_no = result.get("_last_app_no")
             if bill_ym and app_no:
-
                 detail_data = await api.async_get_bill_detail(cons_no, bill_ym, app_no)
-
-                if detail_data and detail_data.get("success"):
-
-                    details = detail_data.get("dataResult", [])
-
-                    if details and isinstance(details, list):
-
-                        detail = details[0]
-
-                        result["this_read"] = detail.get("thisRead", 0)
-
-                        result["this_read_time"] = detail.get("thisReadTime", "未知")
-
-                        result["last_read"] = detail.get("lastRead", 0)
-
-                        result["last_read_time"] = detail.get("lastReadTime", "未知")
-
-                        result["this_gas_used"] = detail.get("gasUsed", 0) or result.get("last_bill_gas_amt", 0)
-
-                        result["bill_amount"] = detail.get("totalAmount", 0) or detail.get("billAmount", 0) or result.get("revbl_amount", 0)
-
-                        result["penalty_amount"] = detail.get("penaltyAmount", 0)
-
-                        step_list = detail.get("gasStepList", [])
-
-                        if step_list:
-
-                            for step in step_list:
-
-                                step_type = step.get("stepType", "")
-
-                                gas_used = step.get("gasUsed", 0)
-
-                                if "一阶" in step_type:
-
-                                    result["step1_gas_used"] = gas_used
-
-                                elif "二阶" in step_type:
-
-                                    result["step2_gas_used"] = gas_used
-
-                                elif "三阶" in step_type:
-
-                                    result["step3_gas_used"] = gas_used
-
-                        else:
-
-                            _LOGGER.info("gasStepList为空，尝试计算阶梯用气量")
-
-                            await _calculate_step_usage(result, api, cons_no)
-
-                    else:
-
-                        result["this_gas_used"] = result.get("last_bill_gas_amt", 0)
-
-                else:
-
-                    result["this_gas_used"] = result.get("last_bill_gas_amt", 0)
-
-                    result["penalty_amount"] = result.get("last_bill_penalty", 0)
-
+                if not bill_response_ok(detail_data):
+                    raise ValueError("Unsuccessful bill detail response")
+                details = detail_data.get("dataResult")
+                if not isinstance(details, list):
+                    raise ValueError("Unexpected bill detail shape")
+                _LOGGER.debug("getBillDetail response: detail_count=%d", len(details))
+                if details:
+                    if not isinstance(details[0], dict):
+                        raise ValueError("Unexpected bill detail entry shape")
+                    parse_bill_detail(details[0], result)
             else:
-
-                _LOGGER.warning(f"缺少账单信息: bill_ym={bill_ym}, app_no={app_no}")
-
+                _LOGGER.debug(
+                    "getBillDetail skipped: bill_month_present=%s, application_present=%s",
+                    bool(bill_ym), bool(app_no),
+                )
         except Exception as e:
-
-            _LOGGER.error(f"获取账单详情失败: {e}")
-
-            if "SESSION_TIMEOUT" in str(e) or "会话超时" in str(e):
-
+            bill_api_error = True
+            _LOGGER.warning("getBillDetail failed: error_type=%s", type(e).__name__)
+            if isinstance(e, SessionTimeoutError) or "SESSION_TIMEOUT" in str(e) or "会话超时" in str(e):
                 session_timeout_count += 1
-
-            result["this_gas_used"] = result.get("last_bill_gas_amt", 0)
-
-
 
         # 6. 获取绑定信息
 
@@ -1334,7 +1209,7 @@ async def async_setup_entry(
 
             else:
 
-                result["integration_status"] = "normal"
+                result["integration_status"] = "api_error" if bill_api_error else "normal"
 
 
 
@@ -1344,75 +1219,8 @@ async def async_setup_entry(
 
 
 
-        # 修复阶梯用气量逻辑：如果一档剩余量>0，二档用气量必须为0
-
-        step1_remain = result.get("step1_remain", 0)
-
-        step2_remain = result.get("step2_remain", 0)
-
-        this_gas_used = result.get("this_gas_used", 0)
-
-        step1_gas_limit = result.get("step1_gas_limit", 330)  # 默认值
-
-        step2_gas_limit = result.get("step2_gas_limit", 170)  # 默认值
-
-
-
-        # 如果gasStepList为空或数据异常，重新计算本月阶梯用气量
-
-        if result.get("step1_gas_used", 0) == 0 and result.get("step2_gas_used", 0) == 0:
-
-            if step1_remain > 0:
-
-                # 所有用气量都在第一档
-
-                result["step1_gas_used"] = this_gas_used
-
-                result["step2_gas_used"] = 0
-
-            else:
-
-                # 部分用气量进入第二档
-
-                result["step1_gas_used"] = min(this_gas_used, step1_gas_limit)
-
-                result["step2_gas_used"] = max(0, this_gas_used - step1_gas_limit)
-
-        else:
-
-            # 如果已有阶梯用气量数据，确保逻辑一致性
-
-            if step1_remain > 0 and result["step2_gas_used"] != 0:
-
-                _LOGGER.warning(f"数据不一致：一档剩余量={step1_remain}>0，但二档用气量={result['step2_gas_used']}，强制设为0")
-
-                result["step2_gas_used"] = 0
-
-                # 调整一档用气量，确保总和等于本期用气量
-
-                result["step1_gas_used"] = this_gas_used
-
-
-
-        # 计算预估燃气账单（基于阶梯用气量和气价）
-
-        step1_gas = result.get("step1_gas_used", 0)
-
-        step2_gas = result.get("step2_gas_used", 0)
-
-        price_step1 = result.get("gas_price_step1", 0)
-
-        price_step2 = result.get("gas_price_step2", 0)
-
-        if step1_gas + step2_gas > 0 and price_step1 > 0:
-
-            estimated_water = step1_gas * price_step1 + step2_gas * price_step2
-
-            result["estimated_gas_bill_amount"] = round(estimated_water, 2)
-
-        else:
-
-            result["estimated_gas_bill_amount"] = 0.0
+        # Only API-provided tier usage/tariffs may produce an estimate.
+        finalize_bill(result)
 
         # 累计燃气费用 = 历史账单总和
         try:
@@ -1426,14 +1234,13 @@ async def async_setup_entry(
         except Exception:
             result["total_gas_cost"] = result.get("total_gas_cost", 0.0)
 
-        _LOGGER.info(f"数据更新完成: 欠费¥{result['arrears']}, 读数{result['this_read']}, 状态={result['integration_status']}")
+        _LOGGER.debug(
+            "数据更新完成: status=%s, bill_amount_available=%s, reading_available=%s",
+            result["integration_status"], result["bill_amount"] is not None,
+            result["this_read"] is not None,
+        )
 
         result["last_fetch_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # bill_amount fallback: 如果 detail API 返回 0，用 revbl_amount 兜底
-        if not result.get("bill_amount") and result.get("revbl_amount"):
-            result["bill_amount"] = result["revbl_amount"]
-            _LOGGER.info("bill_amount 使用 revbl_amount 兜底: %s", result["bill_amount"])
 
         return result
 

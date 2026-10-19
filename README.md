@@ -124,6 +124,15 @@ cp -r crcgas ~/.homeassistant/custom_components/
 - **保持上次有效值** — API 失败时读数不归零，月初未出账时累计值不变
 - **`_safe_float`** — 自动处理 API 千分位逗号数字，防止崩溃
 
+### 账单金额与计价方式
+- `consPrcInfo` 为空时仍读取账单和抄表详情；金额优先取列表 `billAmt`，缺失时取详情总额或完整的 `stepAmt` 合计，不用应收金额替代账单金额。
+- 支持“单一气价”和一至三阶梯明细。单一气价的用量、费用、官方单价（若接口提供）显示在“账单金额”“本期用气量”传感器属性中：`pricing_mode`、`single_gas_used`、`single_gas_amount`、`single_gas_price`、`gas_steps`。
+- `bill_amount_source`、`gas_price_source` 标明金额与官方单价的来源。`average_gas_price` 是账单金额除以本期用气量的**推算均价**，`average_gas_price_source` 明确标注 `calculated`，不会写入官方单价或用于预估账单。
+- 接口失败或字段缺失时，对应账单读数、用量、价格和预估显示未知；列表已有的有效金额、用量仍保留，真实零账单仍显示零。累计表读数继续保留上次有效值。
+- 新增账单诊断日志仅记录响应结构、条目数量、解析来源和异常类型，不记录账户标识、凭据、账单金额或抄表读数。
+
+本地回归测试：`python -m unittest discover -s tests -v`。测试使用合成数据和 Home Assistant/API/历史存储的内存替身，执行真实传感器更新回调，不连接燃气接口或写入 Recorder。
+
 ### ⚡ 数据刷新
 - **API 并行请求** — 4 个接口同时查询，刷新速度从 3-5 秒降至 1-2 秒
 - **阶梯气价动态读取** — 从 API 实时获取阶梯上限，不硬编码（含三档0203）

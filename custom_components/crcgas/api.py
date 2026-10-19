@@ -156,9 +156,8 @@ class HuarunGasApi:
                 **kwargs,
             ) as response:
                 if response.status != 200:
-                    text = await response.text()
-                    _LOGGER.error(f"HTTP {response.status}: {text[:200]}")
-                    raise Exception(f"HTTP {response.status}: {text[:100]}")
+                    _LOGGER.error("HTTP failure: endpoint=%s, status=%s", endpoint, response.status)
+                    raise Exception(f"HTTP {response.status}")
 
                 data = await response.json()
 
@@ -174,7 +173,7 @@ class HuarunGasApi:
             _LOGGER.error(f"请求超时: {method} {url}")
             raise Exception(f"请求超时: {url}")
         except Exception as e:
-            _LOGGER.error(f"请求异常 ({type(e).__name__}): {e}")
+            _LOGGER.error("请求异常: endpoint=%s, error_type=%s", endpoint, type(e).__name__)
             raise
 
     async def async_refresh_token(self) -> Dict[str, Any]:
