@@ -272,7 +272,7 @@ class HuarunGasSensor(RestoreSensor):
 
         elif self.sensor_type == "gas_nature":
             v = data.get("gas_nature")
-            return v if v and v != "未知" else "天然气"
+            return v if v and v != "未知" else "未知"
 
         elif self.sensor_type == "purchase_style":
             v = data.get("purchase_style")

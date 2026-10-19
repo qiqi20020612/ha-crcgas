@@ -254,12 +254,14 @@ class DataFlowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_each_partial_endpoint_failure_is_not_normal(self):
         for endpoint in ("async_query_pay_history", "async_get_gas_bill_list4chart", "async_get_binding_cons"):
-            api, coordinator, _ = await setup_sensor(self.sensor)
+            api, coordinator, entities = await setup_sensor(self.sensor)
             getattr(api, endpoint).side_effect = RuntimeError("secret-token")
             with self.assertLogs("custom_components.crcgas", logging.WARNING) as logs:
                 coordinator.data = await coordinator.update_method()
             self.assertEqual(coordinator.data["integration_status"], "api_error")
             self.assertNotIn("secret-token", "\n".join(logs.output))
+            if endpoint == "async_get_binding_cons":
+                self.assertEqual(entities["gas_nature"].native_value, "未知")
 
     async def test_annual_payment_count_reads_all_pages_and_deduplicates_ids(self):
         api, coordinator, _ = await setup_sensor(self.sensor)
